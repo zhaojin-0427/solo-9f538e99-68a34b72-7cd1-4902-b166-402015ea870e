@@ -7,12 +7,47 @@ import json
 import sqlite3
 
 from . import solver as csp
-from .db import load_entries, load_groups, row_candidates, row_feasible
+from .db import (
+    batch_state_stamp,
+    latest_batch_id,
+    load_entries,
+    load_groups,
+    row_candidates,
+    row_feasible,
+)
 from .parsing import ParsedBatch
 
 
 class InfeasibleError(Exception):
     """当前确认状态与两套合计无共同可行解。"""
+
+
+class StaleExportError(Exception):
+    """打开校对页后批次或确认状态已变化，下载被拒绝。"""
+
+
+def assert_export_current(
+    conn: sqlite3.Connection, batch_id: int, expected_state: int
+) -> None:
+    """校验下载链接仍与当前库内状态一致，否则抛 StaleExportError。
+
+    - 链接对应批次已不是最新批次：提示刷新校对页；
+    - 本批确认状态戳已变化（有新的确认/撤销成功提交）：提示重新核对。
+    """
+    current_batch = latest_batch_id(conn)
+    if current_batch is None:
+        raise StaleExportError("当前没有任何批次，请刷新校对页")
+    if current_batch != batch_id:
+        raise StaleExportError(
+            f"批次已更换（链接对应第 {batch_id} 批，当前最新为第 {current_batch} 批），"
+            "请刷新校对页后重新下载"
+        )
+    stamp = batch_state_stamp(conn, batch_id)
+    if stamp != expected_state:
+        raise StaleExportError(
+            "打开校对页后本批有新的确认或撤销，金额可能已变化，"
+            "请重新核对当前页面后再下载"
+        )
 
 
 def build_problem(conn: sqlite3.Connection, batch_id: int):
@@ -168,19 +203,38 @@ def all_singletons(conn: sqlite3.Connection, batch_id: int) -> bool:
     return bool(rows) and all(len(row_feasible(r)) == 1 for r in rows)
 
 
-def export_csv(conn: sqlite3.Connection, batch_id: int) -> str:
-    """生成入仓 CSV：原票号、窗口、售票日、确定金额（单位：分）。"""
-    # 导出前再实时求解一次，防止库内 feasible 过期
-    feasible = recompute_feasible(conn, batch_id, persist=False)
-    if any(len(v) != 1 for v in feasible):
+def export_csv(conn: sqlite3.Connection, batch_id: int, expected_state: int) -> str:
+    """生成入仓 CSV：原票号、窗口、售票日、确定金额（单位：分）。
+
+    一致性保证（下载内容必须与校对页所见一致）：
+    1. 生成前校验链接携带的批次与确认状态戳仍是当前最新；
+    2. 生成过程在只读快照事务内完成（WAL 下不阻塞其他复核员提交确认/撤销），
+       保证文件内容来自同一状态、每笔只有一个可行金额；
+    3. 生成完毕再次校验：期间若换了批或本批有新的确认/撤销提交，
+       丢弃已生成内容并抛 StaleExportError 拒绝下载。
+    """
+    assert_export_current(conn, batch_id, expected_state)
+    conn.execute("BEGIN")  # 只读快照：导出期间看到同一批数据
+    try:
+        # 导出前再实时求解一次，防止库内 feasible 过期
+        feasible = recompute_feasible(conn, batch_id, persist=False)
+        rows = load_entries(conn, batch_id)
+        content = None
+        if all(len(v) == 1 for v in feasible):
+            buf = io.StringIO()
+            buf.write("﻿")
+            writer = csv.writer(buf)
+            writer.writerow(["票号", "窗口", "售票日", "金额"])
+            for row, vals in zip(rows, feasible):
+                writer.writerow(
+                    [row["ticket_no"], row["window_key"], row["sale_date"], vals[0]]
+                )
+            content = buf.getvalue()
+    finally:
+        conn.rollback()  # 结束只读快照（快照内无写入，rollback 即可释放）
+    # 生成完毕再校验一次：期间若换了批或本批有新的确认/撤销提交，
+    # 丢弃已生成内容并拒绝下载（优先于“多可行金额”提示，原因更准确）
+    assert_export_current(conn, batch_id, expected_state)
+    if content is None:
         raise InfeasibleError("仍有票款存在多个可行金额，暂不能入仓")
-    rows = load_entries(conn, batch_id)
-    buf = io.StringIO()
-    buf.write("﻿")
-    writer = csv.writer(buf)
-    writer.writerow(["票号", "窗口", "售票日", "金额"])
-    for row, vals in zip(rows, feasible):
-        writer.writerow(
-            [row["ticket_no"], row["window_key"], row["sale_date"], vals[0]]
-        )
-    return buf.getvalue()
+    return content

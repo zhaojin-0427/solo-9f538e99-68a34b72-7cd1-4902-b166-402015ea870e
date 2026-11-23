@@ -124,7 +124,7 @@
   </table>
 
   <p style="margin-top:16px">
-    <a href="{{ url_for('export') }}">
+    <a href="{{ url_for('export', batch_id=view.batch.id, state=view.state_stamp) }}">
       <button type="button" {% if not view.all_singletons %}disabled
               title="必须每笔都只剩一个可行金额才能入仓"{% endif %}>
         下载入仓 CSV（票号/窗口/售票日/金额）
@@ -132,6 +132,8 @@
     </a>
     {% if not view.all_singletons %}
       <span class="small muted">按钮在每笔均唯一可行后启用。</span>
+    {% else %}
+      <span class="small muted">链接绑定当前批次与确认状态；若期间有换批或新的确认/撤销，下载会被拒绝并提示刷新。</span>
     {% endif %}
   </p>
 </div>

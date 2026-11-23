@@ -50,6 +50,9 @@ def get_db() -> sqlite3.Connection:
         conn = sqlite3.connect(current_app.config["DATABASE"])
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # 写-写冲突时等待而非立即报 database is locked；
+        # 配合 WAL，导出 CSV 的只读快照不会阻塞其他复核员提交确认/撤销
+        conn.execute("PRAGMA busy_timeout = 5000")
         g.db = conn
     return g.db
 
@@ -63,12 +66,27 @@ def close_db(exc=None) -> None:
 def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
+    # WAL 模式：读快照（导出入仓 CSV）与写入（确认/撤销）互不阻塞。
+    # 该设置持久化在库文件中，对已有数据卷同样生效，无需迁移数据。
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.commit()
 
 
 def latest_batch_id(conn: sqlite3.Connection) -> int | None:
     row = conn.execute("SELECT MAX(id) AS id FROM batches").fetchone()
     return row["id"] if row and row["id"] is not None else None
+
+
+def batch_state_stamp(conn: sqlite3.Connection, batch_id: int) -> int:
+    """批次确认状态戳：本批 confirmations 审计表的最大行 id。
+
+    审计行只增不删，任何一次确认/撤销成功提交都会插入新行使该值增大，
+    即使之后把金额改回原值，状态戳也不会回到旧值。
+    """
+    row = conn.execute(
+        "SELECT MAX(id) AS m FROM confirmations WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    return row["m"] if row and row["m"] is not None else 0
 
 
 def load_batch(conn: sqlite3.Connection, batch_id: int) -> sqlite3.Row | None:

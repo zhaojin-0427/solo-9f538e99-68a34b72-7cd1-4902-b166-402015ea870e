@@ -16,10 +16,10 @@ from flask import (
 from . import db as db_mod
 from . import parsing, services
 from .db import get_db, latest_batch_id, load_batch, load_entries, load_groups
-from .db import row_candidates, row_feasible
+from .db import batch_state_stamp, row_candidates, row_feasible
 from .parsing import ParseError
 from .solver import SearchLimitExceeded, SolverError
-from .services import InfeasibleError
+from .services import InfeasibleError, StaleExportError
 
 
 def create_app(database: str | None = None) -> Flask:
@@ -67,6 +67,8 @@ def create_app(database: str | None = None) -> Flask:
             "date_totals": date_totals,
             "all_singletons": services.all_singletons(conn, batch_id),
             "confirmed_count": sum(1 for e in view_entries if e["confirmed"] is not None),
+            # 下载一致性令牌：页面渲染时的批次确认状态戳，随下载链接提交校验
+            "state_stamp": batch_state_stamp(conn, batch_id),
         }
 
     @app.get("/")
@@ -138,14 +140,27 @@ def create_app(database: str | None = None) -> Flask:
     @app.get("/export")
     def export():
         conn = get_db()
-        batch_id = latest_batch_id(conn)
-        if batch_id is None:
-            flash("当前没有批次，无法下载", "error")
+        # 下载链接必须携带打开校对页时的批次与确认状态戳，
+        # 否则无法保证下载内容与页面所见一致
+        try:
+            batch_id = int(request.args.get("batch_id", ""))
+            expected_state = int(request.args.get("state", ""))
+        except ValueError:
+            flash(
+                "下载链接缺少批次或状态信息（可能来自旧页面），请刷新校对页后重新下载",
+                "error",
+            )
             return redirect(url_for("index"))
         try:
-            content = services.export_csv(conn, batch_id)
+            content = services.export_csv(conn, batch_id, expected_state)
+        except StaleExportError as exc:
+            flash(f"下载被拒绝：{exc}", "error")
+            return redirect(url_for("index"))
         except InfeasibleError as exc:
             flash(f"暂不能入仓：{exc}", "error")
+            return redirect(url_for("index"))
+        except SolverError as exc:
+            flash(f"暂不能入仓：导出时求解失败（{exc}），请稍后重试", "error")
             return redirect(url_for("index"))
         filename = f"warehouse_batch_{batch_id}.csv"
         return Response(
